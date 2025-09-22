@@ -1,4 +1,4 @@
-"""Setup configuration for EPUB Image Extractor."""
+"""Setup configuration for eBook Image Extractor."""
 
 from setuptools import setup, find_packages
 
@@ -11,14 +11,14 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
     ]
 
 setup(
-    name="epub-image-extractor",
-    version="1.0.0",
-    author="Your Name",
-    author_email="your.email@example.com",
-    description="Python tool to extract images from EPUB files with intelligent filtering",
+    name="ebook-image-extractor",
+    version="2.0.0",
+    author="Leonardo Klein",
+    author_email="leo@ziondev.us",
+    description="Python tool to extract images from EPUB and MOBI files with intelligent filtering",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/your-username/epub-extract-images",
+    url="https://github.com/leonardokr/ebook-extract-images",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -33,13 +33,14 @@ setup(
         "Programming Language :: Python :: 3.12",
         "Topic :: Multimedia :: Graphics",
         "Topic :: Text Processing",
+        "Topic :: Software Development :: Libraries :: Python Modules",
     ],
     python_requires=">=3.8",
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "epub-extract=main:main",
+            "ebook-extract=main:main",
         ],
     },
-    keywords="epub, images, extraction, ebook, converter",
+    keywords="epub, mobi, azw, images, extraction, ebook, converter, manga, comics",
 )
