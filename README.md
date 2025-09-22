@@ -1,16 +1,17 @@
-# EPUB Image Extractor
+# eBook Image Extractor
 
-🖼️ **Python tool to extract images from EPUB files with intelligent filtering and automatic organization.**
+🖼️ **Python tool to extract images from eBook files (EPUB and MOBI/AZW) with intelligent filtering and automatic organization.**
 
 ## ✨ Features
 
-- **Smart extraction**: Detects images referenced in HTML/XHTML files
-- **Hash filtering**: Automatically ignores common decorative elements
-- **Automatic organization**: Creates separate directories for each EPUB
-- **Multiple format support**: JPG, PNG, WebP, GIF, BMP, SVG
-- **Detailed statistics**: Complete extraction reports
-- **Command-line interface**: Easy to use and automate
-- **Batch processing**: Processes multiple EPUBs at once
+- **Multi-format support**: EPUB, MOBI, AZW, and AZW3 files
+- **Smart extraction**: Detects images referenced in HTML/XHTML files (EPUB) or embedded in binary records (MOBI)
+- **Hash filtering**: Automatically ignores common decorative elements using SHA256
+- **Automatic organization**: Creates separate directories for each eBook
+- **Multiple image formats**: JPG, PNG, WebP, GIF, BMP, SVG (EPUB only)
+- **Detailed statistics**: Complete extraction reports for both formats
+- **Unified interface**: Single tool for both EPUB and MOBI processing
+- **Batch processing**: Processes multiple eBooks at once with format auto-detection
 
 ## 🚀 Installation
 
@@ -29,8 +30,8 @@ pip install -e .
 ## 📋 Requirements
 
 - Python 3.8 or higher
-- beautifulsoup4 >= 4.12.0
-- lxml >= 4.9.0
+- beautifulsoup4 >= 4.12.0 (for EPUB HTML parsing)
+- Standard library modules for MOBI processing (struct, hashlib)
 
 ## 🔧 Usage
 
@@ -38,146 +39,242 @@ pip install -e .
 
 ```batch
 # Run the batch file for easy use
-run_extractor.bat
+extract_images.bat
 ```
 
 ### Command Line Interface
 
 ```bash
-# Extract images from current directory
-python main.py
+# Auto-detect and extract from both EPUB and MOBI files
+ebook-extract
 
 # Extract from a specific directory
-python main.py /path/to/epubs
+ebook-extract /path/to/ebooks
 
-# Extract ALL images (not just HTML-referenced ones)
-python main.py --all-images
+# Extract only EPUB files
+ebook-extract --format epub
+
+# Extract only MOBI/AZW files
+ebook-extract --format mobi
+
+# Extract ALL images from EPUB (not just HTML-referenced ones)
+ebook-extract --all-images
 
 # Add hash to ignore list
-python main.py --add-ignore-hash abc123def456
+ebook-extract --add-ignore-hash abc123def456
 
 # Verbose mode
-python main.py --verbose
+ebook-extract --verbose
 ```
 
 ### Programmatic Usage
 
 ```python
 from src.epub_extractor import EPUBImageExtractor
+from src.mobi_extractor import MobiImageExtractor
 
-# Create extractor
-extractor = EPUBImageExtractor()
+# EPUB extraction
+epub_extractor = EPUBImageExtractor()
+epub_extractor.extract_from_directory("/path/to/epubs")
 
-# Extract from a directory
-extractor.extract_from_directory("/path/to/epubs")
+# MOBI extraction
+mobi_extractor = MobiImageExtractor()
+mobi_extractor.extract_from_directory("/path/to/mobis")
 
-# Extract from a specific file
-stats = extractor.extract_images_from_epub(
-    "book.epub",
-    "output_folder",
-    use_html_refs=True
-)
+# Single file extraction
+epub_stats = epub_extractor.extract_images_from_epub("book.epub", "output_folder")
+mobi_stats = mobi_extractor.extract_images_from_mobi("book.mobi", "output_folder")
 
-# Add hash to ignore list
-extractor.add_ignored_hash("unwanted_image_hash")
+# Add hash to ignore list (both formats)
+epub_extractor.add_ignored_hash("unwanted_image_hash")
+mobi_extractor.add_ignored_hash("unwanted_image_hash")
 ```
 
-> 📖 **For more detailed usage examples, see [examples/usage_examples.py](examples/usage_examples.py)**
+> 📖 **For more detailed usage examples, see [usage_examples.py](usage_examples.py)**
 
 ## 📁 Output Structure
 
 ```
 source_directory/
-├── book1.epub
-├── book2.epub
-├── book1/              # Automatically created folder
+├── manga1.epub
+├── manga2.mobi
+├── comic.azw3
+├── manga1/              # EPUB extraction
 │   ├── 0000.jpg
 │   ├── 0001.png
 │   └── 0002.webp
-└── book2/              # Automatically created folder
-    ├── 0000.jpg
-    └── 0001.gif
+├── manga2/              # MOBI extraction
+│   ├── 0000.jpg
+│   ├── 0001.jpg
+│   └── 0002.jpg
+└── comic/               # AZW3 extraction
+    ├── 0000.png
+    └── 0001.png
 ```
 
-## 🎯 Advanced Features
+## 🎯 Format-Specific Features
 
-### Smart Filtering
+### EPUB Processing
 
-- Automatically removes common decorative elements
-- SHA256 hash system for precise identification
-- Configurable ignore hash list
+- **HTML mode** (default): Extracts only images referenced in content files
+- **Complete mode** (`--all-images`): Extracts all images found in the ZIP archive
+- **SVG support**: Preserves vector graphics
+- **Path resolution**: Handles complex relative paths in EPUB structure
 
-### Image Detection
+### MOBI/AZW Processing
 
-- **HTML mode** (default): Extracts only images referenced in content
-- **Complete mode**: Extracts all images found in the file
+- **Binary extraction**: Reads PDB (Palm Database) record structure
+- **Magic byte detection**: Identifies images by file signatures
+- **Multiple formats**: Supports .mobi, .azw, .azw3 files
+- **Direct access**: Extracts images without intermediate parsing
 
-### Detailed Statistics
+## 📊 Advanced Statistics
 
 ```
+=== PROCESSING EPUB FILES ===
+3 EPUB file(s) found:
+  - manga_volume_1.epub
+  - manga_volume_2.epub
+  - comic_book.epub
+
+Processing: manga_volume_1.epub
+  Total images extracted: 45
+  8 image(s) ignored by hash.
+
+==================================================
+=== PROCESSING MOBI FILES ===
+2 MOBI file(s) found:
+  - light_novel.mobi
+  - manga_digital.azw3
+
+Processing: light_novel.mobi
+  Total images extracted: 23
+  2 image(s) ignored by hash.
+
 === TOTAL STATISTICS ===
 EPUB files processed: 3
-Total images extracted: 127
-Total images ignored: 8
-Total missing images: 2
+MOBI files processed: 2
+Total images extracted: 195
+Total images ignored: 15
+Total missing images: 1
 ```
 
-## 🛠️ Suggested Improvements
+## 🛠️ Technical Details
+
+### How It Works
+
+#### EPUB Files
+
+1. Opens EPUB as ZIP archive
+2. Parses HTML/XHTML files using BeautifulSoup
+3. Extracts image references from `<img>` tags
+4. Resolves relative paths within EPUB structure
+5. Filters duplicates using SHA256 hashes
+
+#### MOBI Files
+
+1. Reads PDB header to locate record offsets
+2. Scans each binary record for image data
+3. Identifies images using magic bytes:
+   - JPEG: `\xff\xd8\xff`
+   - PNG: `\x89PNG\r\n\x1a\n`
+   - GIF: `GIF87a` or `GIF89a`
+   - BMP: `BM`
+   - WebP: `WEBP` at offset 8
+4. Extracts and saves images with sequential naming
+
+### Supported Formats
+
+| Input Format | Extension | Description                       |
+| ------------ | --------- | --------------------------------- |
+| EPUB         | `.epub`   | Standard eBook format (ZIP-based) |
+| MOBI         | `.mobi`   | Amazon Kindle format (PDB-based)  |
+| AZW          | `.azw`    | Amazon Kindle format              |
+| AZW3         | `.azw3`   | Amazon Kindle format (newer)      |
+
+| Output Format | Extensions      | Support      |
+| ------------- | --------------- | ------------ |
+| JPEG          | `.jpg`, `.jpeg` | Both formats |
+| PNG           | `.png`          | Both formats |
+| GIF           | `.gif`          | Both formats |
+| BMP           | `.bmp`          | Both formats |
+| WebP          | `.webp`         | Both formats |
+| SVG           | `.svg`          | EPUB only    |
+
+## 🛠️ Future Improvements
 
 ### Proposed Features
 
-1. **Graphical Interface (GUI)**
+1. **Enhanced MOBI Support**
 
-   - Drag & drop EPUB files
+   - DRM removal capabilities
+   - Better metadata extraction
+   - Chapter-based organization
+
+2. **Graphical Interface (GUI)**
+
+   - Drag & drop eBook files
    - Image preview before extraction
-   - Manual image selection
+   - Format selection and filtering
 
-2. **Advanced Filters**
+3. **Advanced Processing**
 
-   - Filter by minimum/maximum size
-   - Filter by dimensions (width/height)
-   - Filter by file type
+   - Image deduplication across files
+   - Automatic format conversion
+   - Size and quality optimization
+   - Batch renaming options
 
-3. **Format Conversion**
+4. **Additional Formats**
 
-   - Automatic conversion to specific formats
-   - Image resizing
-   - Quality optimization
+   - PDF image extraction
+   - CBR/CBZ comic support
+   - FB2 format support
 
-4. **Better Organization**
-
-   - Preserve original filenames
-   - Organization by chapters
-   - Image metadata
-
-5. **Additional Features**
-   - Preview mode (list without extracting)
-   - Automatic backup
-   - Detailed operation logs
-   - Support for more ebook formats (MOBI, AZW)
+5. **Cloud Integration**
+   - Direct extraction from cloud storage
+   - Automatic backup to cloud services
 
 ## 📂 Project Structure
 
 ```
-epub-extract-images/
+ebook-extract-images/
 ├── src/
-│   └── epub_extractor.py    # Main class
-├── tests/                   # Unit tests
-├── examples/               # Usage examples
-├── main.py                 # CLI interface
-├── run_extractor.bat       # Windows script (easy use)
-├── setup.py               # Installation configuration
-├── requirements.txt       # Dependencies
-└── README.md             # This documentation
+│   ├── epub_extractor.py    # EPUB extraction logic
+│   └── mobi_extractor.py    # MOBI extraction logic
+├── tests/
+│   └── test_extractors.py   # Comprehensive test suite
+├── main.py                  # Unified CLI interface
+├── usage_examples.py        # Detailed usage examples
+├── extract_images.bat       # Windows batch script
+├── setup.py                # Package configuration
+├── requirements.txt        # Python dependencies
+└── README.md              # This documentation
 ```
 
 ## 🤝 Contributing
 
 1. Fork the project
-2. Create a feature branch (`git checkout -b feature/new-feature`)
-3. Commit your changes (`git commit -am 'Add new feature'`)
-4. Push to the branch (`git push origin feature/new-feature`)
+2. Create a feature branch (`git checkout -b feature/mobi-improvements`)
+3. Commit your changes (`git commit -am 'Add MOBI DRM support'`)
+4. Push to the branch (`git push origin feature/mobi-improvements`)
 5. Open a Pull Request
+
+### Development Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/your-username/ebook-extract-images.git
+cd ebook-extract-images
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run tests
+python test_extractors.py
+
+# Test CLI
+python main.py --help
+```
 
 ## 📝 License
 
@@ -185,16 +282,68 @@ This project is under the MIT license. See the `LICENSE` file for more details.
 
 ## 🐛 Known Issues
 
+### EPUB-specific
+
 - Some EPUBs with non-standard structure may have undetected images
 - Complex SVG images may not be processed correctly
 - Paths with special characters may cause issues on Windows
 
+### MOBI-specific
+
+- DRM-protected files cannot be processed
+- Some AZW3 files with complex structures may not extract all images
+- Very old MOBI formats (PalmDOC) have limited support
+
+### General
+
+- Large files may consume significant memory during processing
+- Network-mounted drives may have slower extraction speeds
+
 ## 💡 Usage Tips
 
-- Use `--all-images` if many images are not being detected
+### For EPUB Files
+
+- Use `--all-images` if many images are not being detected in HTML mode
+- Check for images in unusual locations within the EPUB structure
+- Some comics/manga may store images outside standard directories
+
+### For MOBI Files
+
+- MOBI extraction works best with newer format files
+- If extraction fails, try converting MOBI to EPUB first using Calibre
+- Sequential manga pages are typically extracted in correct order
+
+### General Tips
+
 - Add hashes of unwanted decorative images with `--add-ignore-hash`
 - For better performance with many files, process in smaller batches
+- Use `--verbose` flag for detailed debugging information
 
 ## 📞 Support
 
-Found a bug or have a suggestion? Open an [issue](https://github.com/your-username/epub-extract-images/issues) on GitHub!
+- **Bug reports**: Open an [issue](https://github.com/your-username/ebook-extract-images/issues) on GitHub
+- **Feature requests**: Use GitHub discussions
+- **Questions**: Check existing issues or create a new one
+
+## 🏆 Acknowledgments
+
+- BeautifulSoup team for excellent HTML parsing
+- Amazon for MOBI format documentation
+- Open-source community for testing and feedback
+
+## 📈 Changelog
+
+### Version 2.0.0
+
+- ✅ Added MOBI, AZW, AZW3 support
+- ✅ Unified command-line interface
+- ✅ Enhanced error handling and reporting
+- ✅ Comprehensive test suite
+- ✅ Improved Windows batch script
+
+### Version 1.0.0
+
+- ✅ Initial EPUB support
+- ✅ Hash-based image filtering
+- ✅ Batch processing capabilities
+- ✅ Command-line interface
