@@ -147,7 +147,6 @@ class EPUBImageExtractor:
         """
         stats = {"saved": 0, "ignored": 0, "missing": 0}
 
-        # Create output directory
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
         os.makedirs(output_dir)
@@ -179,7 +178,6 @@ class EPUBImageExtractor:
                 missing_images = []
                 print(f"Extracting all {len(image_paths)} images found in ZIP.")
 
-            # Extract images
             for img_path in image_paths:
                 try:
                     img_data = zipf.read(img_path)
