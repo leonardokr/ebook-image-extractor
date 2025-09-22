@@ -183,7 +183,7 @@ class MobiImageExtractor:
             with open(mobi_path, "rb") as f:
                 data = f.read()
 
-            if not data.startswith(b"TPZ"):
+            if b"BOOKMOBI" not in data[:100]:
                 print(f"Warning: {mobi_path} may not be a valid MOBI file")
                 return stats
 
