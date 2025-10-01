@@ -93,6 +93,85 @@ class EPUBImageExtractor:
                 epub_files.append(os.path.join(directory, file))
         return epub_files
 
+    def get_reading_order(
+        self, zipf: zipfile.ZipFile, all_files: List[str]
+    ) -> List[str]:
+        """
+        Get the reading order of HTML files from the OPF manifest.
+
+        Args:
+            zipf: Open ZipFile object
+            all_files: List of all files in the EPUB
+
+        Returns:
+            List of HTML files in reading order
+        """
+        try:
+            opf_files = [f for f in all_files if f.endswith(".opf")]
+
+            container_opf = None
+            try:
+                with zipf.open("META-INF/container.xml") as f:
+                    container_soup = BeautifulSoup(f.read(), "xml")
+                    rootfile = container_soup.find("rootfile")
+                    if rootfile and isinstance(rootfile, Tag):
+                        container_opf = rootfile.get("full-path")
+            except Exception:
+                pass
+
+            opf_path = (
+                container_opf
+                if container_opf
+                else (opf_files[0] if opf_files else None)
+            )
+
+            if opf_path:
+                with zipf.open(str(opf_path)) as f:
+                    opf_soup = BeautifulSoup(f.read(), "xml")
+
+                manifest = opf_soup.find("manifest")
+                id_to_href = {}
+                if manifest and isinstance(manifest, Tag):
+                    for item in manifest.find_all("item"):
+                        if isinstance(item, Tag):
+                            item_id = item.get("id")
+                            item_href = item.get("href")
+                            if item_id and item_href:
+                                id_to_href[str(item_id)] = str(item_href)
+
+                spine = opf_soup.find("spine")
+                ordered_files = []
+                if spine and isinstance(spine, Tag):
+                    opf_dir = os.path.dirname(str(opf_path))
+                    for itemref in spine.find_all("itemref"):
+                        if isinstance(itemref, Tag):
+                            idref = itemref.get("idref")
+                            if idref and str(idref) in id_to_href:
+                                href = id_to_href[str(idref)]
+                                if opf_dir and opf_dir != ".":
+                                    full_path = f"{opf_dir}/{href}".replace("//", "/")
+                                else:
+                                    full_path = href
+
+                                if full_path in all_files and full_path.endswith(
+                                    (".xhtml", ".html")
+                                ):
+                                    ordered_files.append(full_path)
+
+                html_files = [f for f in all_files if f.endswith((".xhtml", ".html"))]
+                for html_file in html_files:
+                    if html_file not in ordered_files:
+                        ordered_files.append(html_file)
+
+                if ordered_files:
+                    return ordered_files
+
+        except Exception as e:
+            print(f"Warning: Could not read reading order from OPF: {e}")
+
+        html_files = [f for f in all_files if f.endswith((".xhtml", ".html"))]
+        return sorted(html_files)
+
     def extract_image_references(
         self, zipf: zipfile.ZipFile, all_files: List[str]
     ) -> tuple[List[str], List[str]]:
@@ -106,7 +185,7 @@ class EPUBImageExtractor:
         Returns:
             Tuple of (found_images, missing_images)
         """
-        html_files = [f for f in all_files if f.endswith((".xhtml", ".html"))]
+        html_files = self.get_reading_order(zipf, all_files)
         image_paths = []
         missing_images = []
 
