@@ -158,7 +158,7 @@ class TestMobiImageExtractor(unittest.TestCase):
 
     def test_is_image_data_bmp(self):
         """Test BMP image detection."""
-        bmp_data = b"BM\x36\x00\x00\x00\x00\x00\x00\x00"
+        bmp_data = b"BM\x36\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00"
         result = self.extractor._is_image_data(bmp_data)
         self.assertTrue(result)
 
@@ -306,12 +306,14 @@ class TestExtractorCompatibility(unittest.TestCase):
         self.assertNotIn(test_hash, self.epub_extractor.ignored_hashes)
         self.assertNotIn(test_hash, self.mobi_extractor.ignored_hashes)
 
-    def test_stats_structure_compatibility(self):
-        """Test that both extractors use the same stats structure."""
-        epub_stats_keys = set(self.epub_extractor.stats.keys())
-        mobi_stats_keys = set(self.mobi_extractor.stats.keys())
+    def test_extraction_stats_structure(self):
+        """Test that ExtractionStats has all required fields."""
+        from src.base_extractor import ExtractionStats
+        stats = ExtractionStats()
+        stats_dict = stats.to_dict()
 
-        self.assertEqual(epub_stats_keys, mobi_stats_keys)
+        required_keys = {"saved", "ignored", "missing", "duplicates", "filtered_by_size"}
+        self.assertEqual(set(stats_dict.keys()), required_keys)
 
     def test_image_extensions_compatibility(self):
         """Test that both extractors support compatible image extensions."""
