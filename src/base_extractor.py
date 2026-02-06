@@ -10,6 +10,12 @@ from abc import ABC, abstractmethod
 from typing import List, Set, Dict, Optional, Tuple
 from dataclasses import dataclass
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
 from .exceptions import OutputDirectoryError
 
 
@@ -84,12 +90,14 @@ class BaseExtractor(ABC):
         min_image_size: int = 0,
         enable_deduplication: bool = True,
         logger: Optional[logging.Logger] = None,
+        show_progress: bool = True,
     ):
         self.ignored_hashes = ignored_hashes or self.DEFAULT_IGNORED_HASHES.copy()
         self.min_image_size = min_image_size
         self.enable_deduplication = enable_deduplication
         self._extracted_hashes: Set[str] = set()
         self.logger = logger or self._setup_logger()
+        self.show_progress = show_progress and TQDM_AVAILABLE
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger(self.__class__.__name__)
@@ -196,6 +204,11 @@ class BaseExtractor(ABC):
     def extract_metadata(self, file_path: str) -> BookMetadata:
         pass
 
+    def _get_progress_iterator(self, iterable, total: int, desc: str):
+        if self.show_progress:
+            return tqdm(iterable, total=total, desc=desc, unit="file")
+        return iterable
+
     def extract_from_directory(
         self,
         directory: str,
@@ -215,11 +228,14 @@ class BaseExtractor(ABC):
         results: Dict[str, ExtractionStats] = {}
         total_stats = ExtractionStats()
 
-        for file_path in files:
+        file_iterator = self._get_progress_iterator(files, len(files), "Extracting")
+
+        for file_path in file_iterator:
             file_name = os.path.splitext(os.path.basename(file_path))[0]
             output_dir = os.path.join(directory, file_name)
 
-            self.logger.info(f"Processing: {os.path.basename(file_path)}")
+            if not self.show_progress:
+                self.logger.info(f"Processing: {os.path.basename(file_path)}")
 
             if dry_run:
                 print(f"[DRY RUN] Would extract to: {output_dir}")
@@ -235,8 +251,9 @@ class BaseExtractor(ABC):
             total_stats.duplicates += stats.duplicates
             total_stats.filtered_by_size += stats.filtered_by_size
 
-            self.print_stats(stats, prefix="  ")
-            print(f"  Extraction completed for: {output_dir}")
+            if not self.show_progress:
+                self.print_stats(stats, prefix="  ")
+                print(f"  Extraction completed for: {output_dir}")
 
         print(f"\n=== TOTAL STATISTICS ===")
         print(f"Files processed: {len(files)}")
