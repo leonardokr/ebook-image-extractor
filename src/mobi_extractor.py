@@ -7,6 +7,7 @@ Extracts images from MOBI/AZW files with proper reading order support.
 import struct
 import os
 import zlib
+import re
 from typing import List, Set, Dict, Optional, Tuple
 import logging
 
@@ -32,6 +33,10 @@ class MobiImageExtractor(BaseExtractor):
 
     MOBI_MAGIC = b"BOOKMOBI"
     PALMDOC_MAGIC = b"TEXtREAd"
+
+    COMPRESSION_NONE = 1
+    COMPRESSION_PALMDOC = 2
+    COMPRESSION_HUFF = 17480
 
     EXTH_TYPES = {
         100: "author",
@@ -148,6 +153,19 @@ class MobiImageExtractor(BaseExtractor):
 
         return records
 
+    def _read_palmdoc_header(self, data: bytes, record0_start: int) -> Dict:
+        if len(data) < record0_start + 16:
+            return {}
+
+        header = {
+            "compression": struct.unpack(">H", data[record0_start:record0_start + 2])[0],
+            "text_length": struct.unpack(">L", data[record0_start + 4:record0_start + 8])[0],
+            "record_count": struct.unpack(">H", data[record0_start + 8:record0_start + 10])[0],
+            "record_size": struct.unpack(">H", data[record0_start + 10:record0_start + 12])[0],
+            "encryption_type": struct.unpack(">H", data[record0_start + 12:record0_start + 14])[0],
+        }
+        return header
+
     def _read_mobi_header(self, data: bytes, record0_start: int) -> Dict:
         mobi_start = record0_start + 16
 
@@ -185,7 +203,6 @@ class MobiImageExtractor(BaseExtractor):
         if data[exth_start:exth_start + 4] != b"EXTH":
             return {}
 
-        exth_length = struct.unpack(">L", data[exth_start + 4:exth_start + 8])[0]
         exth_count = struct.unpack(">L", data[exth_start + 8:exth_start + 12])[0]
 
         exth_data = {}
@@ -215,22 +232,130 @@ class MobiImageExtractor(BaseExtractor):
 
         return exth_data
 
-    def _get_image_records_in_order(
-        self, data: bytes, records: List[Tuple[int, int]], first_image_index: int
-    ) -> List[Tuple[int, bytes]]:
-        image_records = []
+    def _decompress_palmdoc(self, data: bytes) -> bytes:
+        result = bytearray()
+        i = 0
+        while i < len(data):
+            byte = data[i]
+            i += 1
 
+            if byte == 0:
+                result.append(byte)
+            elif 1 <= byte <= 8:
+                result.extend(data[i:i + byte])
+                i += byte
+            elif byte <= 0x7F:
+                result.append(byte)
+            elif byte <= 0xBF:
+                if i >= len(data):
+                    break
+                next_byte = data[i]
+                i += 1
+                distance = ((byte << 8) | next_byte) >> 3 & 0x7FF
+                length = (next_byte & 0x07) + 3
+                for _ in range(length):
+                    if len(result) >= distance:
+                        result.append(result[-distance])
+                    else:
+                        break
+            else:
+                result.append(ord(' '))
+                result.append(byte ^ 0x80)
+
+        return bytes(result)
+
+    def _find_first_image_record(self, data: bytes, records: List[Tuple[int, int]]) -> int:
         for i, (start, end) in enumerate(records):
-            if i < first_image_index:
+            if start < len(data) and end <= len(data):
+                if self._is_image_data(data[start:end]):
+                    return i
+        return len(records)
+
+    def _extract_text_content(
+        self, data: bytes, records: List[Tuple[int, int]], palmdoc_header: Dict, mobi_header: Dict
+    ) -> bytes:
+        compression = palmdoc_header.get("compression", 1)
+
+        first_image_record = self._find_first_image_record(data, records)
+
+        text_content = bytearray()
+
+        for i in range(1, first_image_record):
+            if i >= len(records):
+                break
+
+            start, end = records[i]
+            if start >= len(data) or end > len(data):
                 continue
 
+            record_data = data[start:end]
+
+            if compression == self.COMPRESSION_PALMDOC:
+                try:
+                    decompressed = self._decompress_palmdoc(record_data)
+                    text_content.extend(decompressed)
+                except Exception:
+                    text_content.extend(record_data)
+            elif compression == self.COMPRESSION_NONE:
+                text_content.extend(record_data)
+
+        return bytes(text_content)
+
+    def _extract_image_order_from_html(
+        self, html_content: bytes
+    ) -> List[int]:
+        """
+        Extract image record indices from HTML content in reading order.
+
+        The HTML contains <img src="Images/imageXXXXX.jpeg"> tags where XXXXX
+        is the PDB record number. This order defines the reading sequence.
+        """
+        image_order = []
+        seen = set()
+        pattern = rb'<img[^>]+src=["\']?(?:Images/)?(?:image|cover|thumb)?0*(\d+)\.\w+["\']?'
+
+        for match in re.finditer(pattern, html_content, re.IGNORECASE):
+            try:
+                record_idx = int(match.group(1))
+                if record_idx not in seen:
+                    seen.add(record_idx)
+                    image_order.append(record_idx)
+            except (ValueError, IndexError):
+                continue
+
+        return image_order
+
+    def _get_image_records_in_order(
+        self,
+        data: bytes,
+        records: List[Tuple[int, int]],
+        html_order: Optional[List[int]] = None,
+    ) -> List[Tuple[int, bytes]]:
+        """
+        Get image records in the correct reading order.
+
+        If html_order is provided, images are returned in that order.
+        Otherwise, falls back to sequential order.
+        """
+        image_map: Dict[int, bytes] = {}
+        for i, (start, end) in enumerate(records):
             if start >= len(data) or end > len(data):
                 continue
 
             record_data = data[start:end]
 
             if self._is_image_data(record_data):
-                image_records.append((i, record_data))
+                image_map[i] = record_data
+
+        if not html_order:
+            return []
+
+        image_records = []
+        seen = set()
+        for record_idx in html_order:
+            if record_idx in image_map and record_idx not in seen:
+                seen.add(record_idx)
+                image_records.append((record_idx, image_map[record_idx]))
 
         return image_records
 
@@ -304,19 +429,28 @@ class MobiImageExtractor(BaseExtractor):
             self.logger.debug(f"Found {len(records)} PDB records")
 
             record0_start = records[0][0]
+            palmdoc_header = self._read_palmdoc_header(data, record0_start)
             mobi_header = self._read_mobi_header(data, record0_start)
 
-            first_image_index = 0
             if mobi_header:
-                first_image_index = mobi_header.get("first_image_index", 0)
-                self.logger.debug(f"First image index from MOBI header: {first_image_index}")
-
                 if mobi_header.get("exth_flags", 0) & 0x40:
                     self._exth_data = self._read_exth_header(
                         data, record0_start, mobi_header["header_length"]
                     )
 
-            image_records = self._get_image_records_in_order(data, records, first_image_index)
+            html_order = None
+            if palmdoc_header and mobi_header:
+                try:
+                    html_content = self._extract_text_content(
+                        data, records, palmdoc_header, mobi_header
+                    )
+                    if html_content:
+                        html_order = self._extract_image_order_from_html(html_content)
+                        self.logger.debug(f"Found {len(html_order)} images in HTML reading order")
+                except Exception as e:
+                    self.logger.warning(f"Could not extract HTML order: {e}")
+
+            image_records = self._get_image_records_in_order(data, records, html_order)
             self.logger.info(f"Found {len(image_records)} images in MOBI file")
 
             if dry_run:
