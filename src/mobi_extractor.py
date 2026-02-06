@@ -1,21 +1,25 @@
 """
 MOBI Image Extractor
 
-A Python tool to extract images from MOBI/AZW files with advanced filtering and organization features.
-Compatible with the epub-extract-images project structure.
+Extracts images from MOBI/AZW files with proper reading order support.
 """
 
 import struct
 import os
-import shutil
-import hashlib
+import zlib
 from typing import List, Set, Dict, Optional, Tuple
+import logging
+
+from .base_extractor import BaseExtractor, ExtractionStats, BookMetadata
+from .exceptions import InvalidFileError, CorruptedFileError, ExtractionError
 
 
-class MobiImageExtractor:
+class MobiImageExtractor(BaseExtractor):
     """
     Extracts images from MOBI files with filtering and organization capabilities.
     """
+
+    SUPPORTED_EXTENSIONS: Set[str] = {".mobi", ".azw", ".azw3"}
 
     IMAGE_EXTENSIONS: Set[str] = {
         ".jpg",
@@ -26,96 +30,67 @@ class MobiImageExtractor:
         ".bmp",
     }
 
-    DEFAULT_IGNORED_HASHES: Set[str] = {
-        "1fcf4c601de84ae1d66e36f93b83b33b453f77aeb345be830f1fc66439fdb50d",
-        "933f630f9a34dd68d5047813ec3272b8b3634011e5ed90be50dfd765a1303263",
-        "ff1e53b8a020868ad267555daf1091ddafdb103a6364a87275bbf34a78ba7c84",
+    MOBI_MAGIC = b"BOOKMOBI"
+    PALMDOC_MAGIC = b"TEXtREAd"
+
+    EXTH_TYPES = {
+        100: "author",
+        101: "publisher",
+        103: "description",
+        104: "isbn",
+        105: "subject",
+        106: "publishdate",
+        109: "rights",
+        201: "cover_offset",
+        202: "thumb_offset",
+        503: "title",
     }
 
-    def __init__(self, ignored_hashes: Optional[Set[str]] = None):
-        """
-        Initialize the MOBI image extractor.
+    def __init__(
+        self,
+        ignored_hashes: Optional[Set[str]] = None,
+        min_image_size: int = 0,
+        enable_deduplication: bool = True,
+        logger: Optional[logging.Logger] = None,
+    ):
+        super().__init__(ignored_hashes, min_image_size, enable_deduplication, logger)
+        self._mobi_header: Dict = {}
+        self._exth_data: Dict = {}
 
-        Args:
-            ignored_hashes: Set of SHA256 hashes to ignore during extraction
-        """
-        self.ignored_hashes = ignored_hashes or self.DEFAULT_IGNORED_HASHES.copy()
-        self.stats: Dict[str, int] = {
-            "processed_files": 0,
-            "extracted_images": 0,
-            "ignored_images": 0,
-            "missing_images": 0,
-        }
-
-    def hash_bytes_sha256(self, data: bytes) -> str:
-        """
-        Calculate SHA256 hash of byte data.
-
-        Args:
-            data: Byte data to hash
-
-        Returns:
-            SHA256 hash as hexadecimal string
-        """
-        return hashlib.sha256(data).hexdigest()
+    def find_files(self, directory: str, recursive: bool = False) -> List[str]:
+        mobi_files = []
+        if recursive:
+            for root, _, files in os.walk(directory):
+                for file in files:
+                    if any(file.lower().endswith(ext) for ext in self.SUPPORTED_EXTENSIONS):
+                        mobi_files.append(os.path.join(root, file))
+        else:
+            for file in os.listdir(directory):
+                if any(file.lower().endswith(ext) for ext in self.SUPPORTED_EXTENSIONS):
+                    mobi_files.append(os.path.join(directory, file))
+        return sorted(mobi_files)
 
     def find_mobi_files(self, directory: str) -> List[str]:
-        """
-        Find all MOBI files in the specified directory.
-
-        Args:
-            directory: Directory to search for MOBI files
-
-        Returns:
-            List of MOBI file paths
-        """
-        mobi_files = []
-        for file in os.listdir(directory):
-            if file.lower().endswith((".mobi", ".azw", ".azw3")):
-                mobi_files.append(os.path.join(directory, file))
-        return mobi_files
+        return self.find_files(directory, recursive=False)
 
     def _is_image_data(self, data: bytes) -> bool:
-        """
-        Check if data represents an image based on magic bytes.
-
-        Args:
-            data: Byte data to check
-
-        Returns:
-            True if data appears to be an image
-        """
         if len(data) < 8:
             return False
 
-        # JPEG
         if data.startswith(b"\xff\xd8\xff"):
             return True
-        # PNG
         if data.startswith(b"\x89PNG\r\n\x1a\n"):
             return True
-        # GIF
         if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
             return True
-        # BMP
-        if data.startswith(b"BM"):
+        if data.startswith(b"BM") and len(data) > 14:
             return True
-        # WebP
         if len(data) > 12 and data[8:12] == b"WEBP":
             return True
 
         return False
 
     def _get_image_extension(self, data: bytes) -> str:
-        """
-        Determine image extension from data.
-
-        Args:
-            data: Image byte data
-
-        Returns:
-            File extension string
-        """
         if data.startswith(b"\xff\xd8\xff"):
             return ".jpg"
         elif data.startswith(b"\x89PNG"):
@@ -127,18 +102,31 @@ class MobiImageExtractor:
         elif len(data) > 12 and data[8:12] == b"WEBP":
             return ".webp"
         else:
-            return ".jpg"  # Default fallback
+            return ".jpg"
+
+    def _read_pdb_header(self, data: bytes) -> Dict:
+        if len(data) < 78:
+            raise CorruptedFileError("", "File too small for PDB header")
+
+        header = {
+            "name": data[0:32].rstrip(b"\x00").decode("latin-1", errors="ignore"),
+            "attributes": struct.unpack(">H", data[32:34])[0],
+            "version": struct.unpack(">H", data[34:36])[0],
+            "creation_time": struct.unpack(">L", data[36:40])[0],
+            "modification_time": struct.unpack(">L", data[40:44])[0],
+            "backup_time": struct.unpack(">L", data[44:48])[0],
+            "modification_number": struct.unpack(">L", data[48:52])[0],
+            "app_info_offset": struct.unpack(">L", data[52:56])[0],
+            "sort_info_offset": struct.unpack(">L", data[56:60])[0],
+            "type": data[60:64],
+            "creator": data[64:68],
+            "unique_id_seed": struct.unpack(">L", data[68:72])[0],
+            "next_record_list": struct.unpack(">L", data[72:76])[0],
+            "num_records": struct.unpack(">H", data[76:78])[0],
+        }
+        return header
 
     def _read_pdb_records(self, data: bytes) -> List[Tuple[int, int]]:
-        """
-        Read PDB record offsets from MOBI file.
-
-        Args:
-            data: MOBI file data
-
-        Returns:
-            List of (start_offset, end_offset) tuples
-        """
         if len(data) < 78:
             return []
 
@@ -160,123 +148,227 @@ class MobiImageExtractor:
 
         return records
 
-    def extract_images_from_mobi(
-        self, mobi_path: str, output_dir: str
-    ) -> Dict[str, int]:
-        """
-        Extract images from a single MOBI file.
+    def _read_mobi_header(self, data: bytes, record0_start: int) -> Dict:
+        mobi_start = record0_start + 16
 
-        Args:
-            mobi_path: Path to the MOBI file
-            output_dir: Output directory for extracted images
+        if len(data) < mobi_start + 132:
+            return {}
 
-        Returns:
-            Dictionary with extraction statistics
-        """
-        stats = {"saved": 0, "ignored": 0, "missing": 0}
+        if data[mobi_start:mobi_start + 4] != b"MOBI":
+            return {}
 
-        if os.path.exists(output_dir):
-            shutil.rmtree(output_dir)
-        os.makedirs(output_dir)
+        header = {
+            "identifier": data[mobi_start:mobi_start + 4],
+            "header_length": struct.unpack(">L", data[mobi_start + 4:mobi_start + 8])[0],
+            "mobi_type": struct.unpack(">L", data[mobi_start + 8:mobi_start + 12])[0],
+            "text_encoding": struct.unpack(">L", data[mobi_start + 12:mobi_start + 16])[0],
+            "unique_id": struct.unpack(">L", data[mobi_start + 16:mobi_start + 20])[0],
+            "file_version": struct.unpack(">L", data[mobi_start + 20:mobi_start + 24])[0],
+            "first_non_book_index": struct.unpack(">L", data[mobi_start + 80:mobi_start + 84])[0],
+            "full_name_offset": struct.unpack(">L", data[mobi_start + 84:mobi_start + 88])[0],
+            "full_name_length": struct.unpack(">L", data[mobi_start + 88:mobi_start + 92])[0],
+            "language": struct.unpack(">L", data[mobi_start + 92:mobi_start + 96])[0],
+            "first_image_index": struct.unpack(">L", data[mobi_start + 108:mobi_start + 112])[0],
+        }
+
+        if header["header_length"] >= 244:
+            header["exth_flags"] = struct.unpack(">L", data[mobi_start + 128:mobi_start + 132])[0]
+
+        return header
+
+    def _read_exth_header(self, data: bytes, record0_start: int, mobi_header_length: int) -> Dict:
+        exth_start = record0_start + 16 + mobi_header_length
+
+        if len(data) < exth_start + 12:
+            return {}
+
+        if data[exth_start:exth_start + 4] != b"EXTH":
+            return {}
+
+        exth_length = struct.unpack(">L", data[exth_start + 4:exth_start + 8])[0]
+        exth_count = struct.unpack(">L", data[exth_start + 8:exth_start + 12])[0]
+
+        exth_data = {}
+        pos = exth_start + 12
+
+        for _ in range(exth_count):
+            if pos + 8 > len(data):
+                break
+
+            record_type = struct.unpack(">L", data[pos:pos + 4])[0]
+            record_length = struct.unpack(">L", data[pos + 4:pos + 8])[0]
+
+            if record_length < 8:
+                break
+
+            value_data = data[pos + 8:pos + record_length]
+
+            if record_type in self.EXTH_TYPES:
+                field_name = self.EXTH_TYPES[record_type]
+                if record_type in (201, 202):
+                    if len(value_data) >= 4:
+                        exth_data[field_name] = struct.unpack(">L", value_data[:4])[0]
+                else:
+                    exth_data[field_name] = value_data.decode("utf-8", errors="ignore")
+
+            pos += record_length
+
+        return exth_data
+
+    def _get_image_records_in_order(
+        self, data: bytes, records: List[Tuple[int, int]], first_image_index: int
+    ) -> List[Tuple[int, bytes]]:
+        image_records = []
+
+        for i, (start, end) in enumerate(records):
+            if i < first_image_index:
+                continue
+
+            if start >= len(data) or end > len(data):
+                continue
+
+            record_data = data[start:end]
+
+            if self._is_image_data(record_data):
+                image_records.append((i, record_data))
+
+        return image_records
+
+    def extract_metadata(self, file_path: str) -> BookMetadata:
+        metadata = BookMetadata()
 
         try:
-            with open(mobi_path, "rb") as f:
+            with open(file_path, "rb") as f:
                 data = f.read()
 
-            if b"BOOKMOBI" not in data[:100]:
-                print(f"Warning: {mobi_path} may not be a valid MOBI file")
-                return stats
+            if self.MOBI_MAGIC not in data[:100] and self.PALMDOC_MAGIC not in data[:100]:
+                return metadata
 
             records = self._read_pdb_records(data)
-            print(f"Found {len(records)} records in MOBI file")
+            if not records:
+                return metadata
 
-            for start, end in records:
-                if start >= len(data) or end > len(data):
-                    continue
+            record0_start = records[0][0]
+            mobi_header = self._read_mobi_header(data, record0_start)
 
-                record_data = data[start:end]
+            if not mobi_header:
+                return metadata
 
-                if self._is_image_data(record_data):
-                    img_hash = self.hash_bytes_sha256(record_data)
+            if mobi_header.get("full_name_offset") and mobi_header.get("full_name_length"):
+                name_start = record0_start + mobi_header["full_name_offset"]
+                name_end = name_start + mobi_header["full_name_length"]
+                if name_end <= len(data):
+                    metadata.title = data[name_start:name_end].decode("utf-8", errors="ignore")
 
-                    if img_hash in self.ignored_hashes:
-                        stats["ignored"] += 1
-                        continue
+            if mobi_header.get("exth_flags", 0) & 0x40:
+                exth_data = self._read_exth_header(data, record0_start, mobi_header["header_length"])
 
-                    ext = self._get_image_extension(record_data)
-                    filename = f"{stats['saved']:04}{ext}"
+                if exth_data.get("title"):
+                    metadata.title = exth_data["title"]
+                if exth_data.get("author"):
+                    metadata.author = exth_data["author"]
+                if exth_data.get("publisher"):
+                    metadata.publisher = exth_data["publisher"]
 
-                    output_path = os.path.join(output_dir, filename)
-                    with open(output_path, "wb") as img_file:
-                        img_file.write(record_data)
-
-                    stats["saved"] += 1
+                if exth_data.get("cover_offset") is not None:
+                    first_image = mobi_header.get("first_image_index", 0)
+                    cover_record_idx = first_image + exth_data["cover_offset"]
+                    if cover_record_idx < len(records):
+                        start, end = records[cover_record_idx]
+                        if start < len(data) and end <= len(data):
+                            cover_data = data[start:end]
+                            if self._is_image_data(cover_data):
+                                metadata.cover_image = cover_data
 
         except Exception as e:
-            print(f"Error processing {mobi_path}: {e}")
-            return stats
+            self.logger.warning(f"Could not extract metadata from {file_path}: {e}")
+
+        return metadata
+
+    def extract_images(
+        self, file_path: str, output_dir: str, dry_run: bool = False
+    ) -> ExtractionStats:
+        stats = ExtractionStats()
+
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+
+            if self.MOBI_MAGIC not in data[:100] and self.PALMDOC_MAGIC not in data[:100]:
+                raise InvalidFileError(file_path, "MOBI")
+
+            records = self._read_pdb_records(data)
+            if not records:
+                raise CorruptedFileError(file_path, "No PDB records found")
+
+            self.logger.debug(f"Found {len(records)} PDB records")
+
+            record0_start = records[0][0]
+            mobi_header = self._read_mobi_header(data, record0_start)
+
+            first_image_index = 0
+            if mobi_header:
+                first_image_index = mobi_header.get("first_image_index", 0)
+                self.logger.debug(f"First image index from MOBI header: {first_image_index}")
+
+                if mobi_header.get("exth_flags", 0) & 0x40:
+                    self._exth_data = self._read_exth_header(
+                        data, record0_start, mobi_header["header_length"]
+                    )
+
+            image_records = self._get_image_records_in_order(data, records, first_image_index)
+            self.logger.info(f"Found {len(image_records)} images in MOBI file")
+
+            if dry_run:
+                for idx, record_data in image_records:
+                    img_hash = self.hash_bytes_sha256(record_data)
+                    should_skip, reason = self.should_skip_image(record_data, img_hash)
+                    if not should_skip:
+                        stats.saved += 1
+                    elif reason == "ignored_hash":
+                        stats.ignored += 1
+                    elif reason == "duplicate":
+                        stats.duplicates += 1
+                    elif reason == "too_small":
+                        stats.filtered_by_size += 1
+                return stats
+
+            self.prepare_output_directory(output_dir)
+
+            for idx, record_data in image_records:
+                img_hash = self.hash_bytes_sha256(record_data)
+                should_skip, reason = self.should_skip_image(record_data, img_hash)
+
+                if should_skip:
+                    if reason == "ignored_hash":
+                        stats.ignored += 1
+                    elif reason == "duplicate":
+                        stats.duplicates += 1
+                    elif reason == "too_small":
+                        stats.filtered_by_size += 1
+                    continue
+
+                ext = self._get_image_extension(record_data)
+                self.save_image(record_data, output_dir, stats.saved, ext)
+                stats.saved += 1
+
+        except (InvalidFileError, CorruptedFileError):
+            raise
+        except Exception as e:
+            raise ExtractionError(file_path, str(e))
 
         return stats
 
-    def extract_from_directory(self, directory: str) -> None:
-        """
-        Extract images from all MOBI files in a directory.
+    def extract_images_from_mobi(
+        self, mobi_path: str, output_dir: str
+    ) -> Dict[str, int]:
+        stats = self.extract_images(mobi_path, output_dir)
+        return stats.to_dict()
 
-        Args:
-            directory: Directory containing MOBI files
-        """
-        mobi_files = self.find_mobi_files(directory)
-
-        if not mobi_files:
-            print("No .mobi/.azw/.azw3 files found.")
-            return
-
-        print(f"{len(mobi_files)} MOBI file(s) found:")
-        for mobi_file in mobi_files:
-            print(f"  - {os.path.basename(mobi_file)}")
-
-        total_stats = {"saved": 0, "ignored": 0, "missing": 0}
-
-        for mobi_path in mobi_files:
-            mobi_name = os.path.splitext(os.path.basename(mobi_path))[0]
-            output_dir = os.path.join(directory, mobi_name)
-
-            print(f"\nProcessing: {os.path.basename(mobi_path)}")
-
-            stats = self.extract_images_from_mobi(mobi_path, output_dir)
-
-            for key in total_stats:
-                total_stats[key] += stats[key]
-
-            print(f"  Total images extracted: {stats['saved']}")
-            print(f"  {stats['ignored']} image(s) ignored by hash.")
-            if stats["missing"] > 0:
-                print(f"  {stats['missing']} image(s) not found.")
-            else:
-                print("  No missing images.")
-
-            print(f"  Extraction completed for: {output_dir}")
-
-        print("\n=== TOTAL STATISTICS ===")
-        print(f"MOBI files processed: {len(mobi_files)}")
-        print(f"Total images extracted: {total_stats['saved']}")
-        print(f"Total images ignored: {total_stats['ignored']}")
-        print(f"Total missing images: {total_stats['missing']}")
-
-    def add_ignored_hash(self, hash_value: str) -> None:
-        """
-        Add a hash to the ignored list.
-
-        Args:
-            hash_value: SHA256 hash to ignore
-        """
-        self.ignored_hashes.add(hash_value)
-
-    def remove_ignored_hash(self, hash_value: str) -> None:
-        """
-        Remove a hash from the ignored list.
-
-        Args:
-            hash_value: SHA256 hash to remove from ignored list
-        """
-        self.ignored_hashes.discard(hash_value)
+    def extract_from_directory(
+        self,
+        directory: str,
+        recursive: bool = False,
+        dry_run: bool = False,
+    ) -> Dict[str, ExtractionStats]:
+        return super().extract_from_directory(directory, recursive, dry_run)
