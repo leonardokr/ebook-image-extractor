@@ -1,22 +1,26 @@
 """
 EPUB Image Extractor
 
-A Python tool to extract images from EPUB files with advanced filtering and organization features.
+Extracts images from EPUB files with proper reading order from OPF spine.
 """
 
 import zipfile
 import os
-import shutil
-import hashlib
-from typing import List, Set, Dict, Optional
+from typing import List, Set, Dict, Optional, Tuple
+import logging
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
+from .base_extractor import BaseExtractor, ExtractionStats, BookMetadata
+from .exceptions import InvalidFileError, ExtractionError
 
-class EPUBImageExtractor:
+
+class EPUBImageExtractor(BaseExtractor):
     """
     Extracts images from EPUB files with filtering and organization capabilities.
     """
+
+    SUPPORTED_EXTENSIONS: Set[str] = {".epub"}
 
     IMAGE_EXTENSIONS: Set[str] = {
         ".jpg",
@@ -28,84 +32,38 @@ class EPUBImageExtractor:
         ".svg",
     }
 
-    DEFAULT_IGNORED_HASHES: Set[str] = {
-        "1fcf4c601de84ae1d66e36f93b83b33b453f77aeb345be830f1fc66439fdb50d",
-        "933f630f9a34dd68d5047813ec3272b8b3634011e5ed90be50dfd765a1303263",
-        "ff1e53b8a020868ad267555daf1091ddafdb103a6364a87275bbf34a78ba7c84",
-    }
+    def __init__(
+        self,
+        ignored_hashes: Optional[Set[str]] = None,
+        min_image_size: int = 0,
+        enable_deduplication: bool = True,
+        logger: Optional[logging.Logger] = None,
+    ):
+        super().__init__(ignored_hashes, min_image_size, enable_deduplication, logger)
 
-    def __init__(self, ignored_hashes: Optional[Set[str]] = None):
-        """
-        Initialize the EPUB image extractor.
-
-        Args:
-            ignored_hashes: Set of SHA256 hashes to ignore during extraction
-        """
-        self.ignored_hashes = ignored_hashes or self.DEFAULT_IGNORED_HASHES.copy()
-        self.stats: Dict[str, int] = {
-            "processed_files": 0,
-            "extracted_images": 0,
-            "ignored_images": 0,
-            "missing_images": 0,
-        }
-
-    def normalize_path(self, base_path: str, relative_path: str) -> str:
-        """
-        Normalize relative paths in EPUB files.
-
-        Args:
-            base_path: Base file path
-            relative_path: Relative path to normalize
-
-        Returns:
-            Normalized path string
-        """
-        base_dir = os.path.dirname(base_path)
-        return os.path.normpath(os.path.join(base_dir, relative_path)).replace(
-            "\\", "/"
-        )
-
-    def hash_bytes_sha256(self, data: bytes) -> str:
-        """
-        Calculate SHA256 hash of byte data.
-
-        Args:
-            data: Byte data to hash
-
-        Returns:
-            SHA256 hash as hexadecimal string
-        """
-        return hashlib.sha256(data).hexdigest()
+    def find_files(self, directory: str, recursive: bool = False) -> List[str]:
+        epub_files = []
+        if recursive:
+            for root, _, files in os.walk(directory):
+                for file in files:
+                    if file.lower().endswith(".epub"):
+                        epub_files.append(os.path.join(root, file))
+        else:
+            for file in os.listdir(directory):
+                if file.lower().endswith(".epub"):
+                    epub_files.append(os.path.join(directory, file))
+        return sorted(epub_files)
 
     def find_epub_files(self, directory: str) -> List[str]:
-        """
-        Find all EPUB files in the specified directory.
+        return self.find_files(directory, recursive=False)
 
-        Args:
-            directory: Directory to search for EPUB files
-
-        Returns:
-            List of EPUB file paths
-        """
-        epub_files = []
-        for file in os.listdir(directory):
-            if file.lower().endswith(".epub"):
-                epub_files.append(os.path.join(directory, file))
-        return epub_files
+    def normalize_path(self, base_path: str, relative_path: str) -> str:
+        base_dir = os.path.dirname(base_path)
+        return os.path.normpath(os.path.join(base_dir, relative_path)).replace("\\", "/")
 
     def get_reading_order(
         self, zipf: zipfile.ZipFile, all_files: List[str]
     ) -> List[str]:
-        """
-        Get the reading order of HTML files from the OPF manifest.
-
-        Args:
-            zipf: Open ZipFile object
-            all_files: List of all files in the EPUB
-
-        Returns:
-            List of HTML files in reading order
-        """
         try:
             opf_files = [f for f in all_files if f.endswith(".opf")]
 
@@ -167,24 +125,14 @@ class EPUBImageExtractor:
                     return ordered_files
 
         except Exception as e:
-            print(f"Warning: Could not read reading order from OPF: {e}")
+            self.logger.warning(f"Could not read reading order from OPF: {e}")
 
         html_files = [f for f in all_files if f.endswith((".xhtml", ".html"))]
         return sorted(html_files)
 
     def extract_image_references(
         self, zipf: zipfile.ZipFile, all_files: List[str]
-    ) -> tuple[List[str], List[str]]:
-        """
-        Extract image references from HTML/XHTML files in the EPUB.
-
-        Args:
-            zipf: Open ZipFile object
-            all_files: List of all files in the EPUB
-
-        Returns:
-            Tuple of (found_images, missing_images)
-        """
+    ) -> Tuple[List[str], List[str]]:
         html_files = self.get_reading_order(zipf, all_files)
         image_paths = []
         missing_images = []
@@ -198,159 +146,217 @@ class EPUBImageExtractor:
                             raw_src = img_tag.get("src")
                             if raw_src and isinstance(raw_src, str):
                                 resolved = self.normalize_path(html_file, raw_src)
-                                if (
-                                    resolved in all_files
-                                    and resolved not in image_paths
-                                ):
+                                if resolved in all_files and resolved not in image_paths:
                                     image_paths.append(resolved)
                                 elif resolved not in all_files:
                                     missing_images.append(resolved)
             except Exception as e:
-                print(f"Error processing {html_file}: {e}")
+                self.logger.warning(f"Error processing {html_file}: {e}")
 
         return image_paths, missing_images
+
+    def extract_metadata(self, file_path: str) -> BookMetadata:
+        metadata = BookMetadata()
+
+        try:
+            with zipfile.ZipFile(file_path, "r") as zipf:
+                all_files = zipf.namelist()
+                opf_files = [f for f in all_files if f.endswith(".opf")]
+
+                opf_path = None
+                try:
+                    with zipf.open("META-INF/container.xml") as f:
+                        container_soup = BeautifulSoup(f.read(), "xml")
+                        rootfile = container_soup.find("rootfile")
+                        if rootfile and isinstance(rootfile, Tag):
+                            opf_path = rootfile.get("full-path")
+                except Exception:
+                    pass
+
+                if not opf_path and opf_files:
+                    opf_path = opf_files[0]
+
+                if opf_path:
+                    with zipf.open(str(opf_path)) as f:
+                        opf_soup = BeautifulSoup(f.read(), "xml")
+
+                    title_tag = opf_soup.find("dc:title")
+                    if title_tag:
+                        metadata.title = title_tag.get_text()
+
+                    creator_tag = opf_soup.find("dc:creator")
+                    if creator_tag:
+                        metadata.author = creator_tag.get_text()
+
+                    publisher_tag = opf_soup.find("dc:publisher")
+                    if publisher_tag:
+                        metadata.publisher = publisher_tag.get_text()
+
+                    language_tag = opf_soup.find("dc:language")
+                    if language_tag:
+                        metadata.language = language_tag.get_text()
+
+                    manifest = opf_soup.find("manifest")
+                    if manifest and isinstance(manifest, Tag):
+                        for item in manifest.find_all("item"):
+                            if isinstance(item, Tag):
+                                properties = item.get("properties", "")
+                                if "cover-image" in str(properties):
+                                    href = item.get("href")
+                                    if href:
+                                        opf_dir = os.path.dirname(str(opf_path))
+                                        if opf_dir:
+                                            cover_path = f"{opf_dir}/{href}".replace("//", "/")
+                                        else:
+                                            cover_path = str(href)
+                                        try:
+                                            metadata.cover_image = zipf.read(cover_path)
+                                        except Exception:
+                                            pass
+                                    break
+
+        except Exception as e:
+            self.logger.warning(f"Could not extract metadata from {file_path}: {e}")
+
+        return metadata
+
+    def extract_images(
+        self, file_path: str, output_dir: str, dry_run: bool = False, use_html_refs: bool = True
+    ) -> ExtractionStats:
+        stats = ExtractionStats()
+
+        try:
+            with zipfile.ZipFile(file_path, "r") as zipf:
+                all_files = zipf.namelist()
+
+                if use_html_refs:
+                    image_paths, missing_images = self.extract_image_references(zipf, all_files)
+                    if not image_paths:
+                        image_paths = [
+                            f for f in all_files
+                            if os.path.splitext(f)[1].lower() in self.IMAGE_EXTENSIONS
+                        ]
+                        self.logger.info(
+                            f"No valid HTML images found. Using {len(image_paths)} images from ZIP."
+                        )
+                    else:
+                        self.logger.info(f"{len(image_paths)} image(s) found via HTML.")
+                else:
+                    image_paths = [
+                        f for f in all_files
+                        if os.path.splitext(f)[1].lower() in self.IMAGE_EXTENSIONS
+                    ]
+                    missing_images = []
+                    self.logger.info(f"Extracting all {len(image_paths)} images found in ZIP.")
+
+                if dry_run:
+                    for img_path in image_paths:
+                        try:
+                            img_data = zipf.read(img_path)
+                            img_hash = self.hash_bytes_sha256(img_data)
+                            should_skip, reason = self.should_skip_image(img_data, img_hash)
+                            if not should_skip:
+                                stats.saved += 1
+                            elif reason == "ignored_hash":
+                                stats.ignored += 1
+                            elif reason == "duplicate":
+                                stats.duplicates += 1
+                            elif reason == "too_small":
+                                stats.filtered_by_size += 1
+                        except Exception:
+                            stats.missing += 1
+                    return stats
+
+                self.prepare_output_directory(output_dir)
+
+                for img_path in image_paths:
+                    try:
+                        img_data = zipf.read(img_path)
+                        img_hash = self.hash_bytes_sha256(img_data)
+                        should_skip, reason = self.should_skip_image(img_data, img_hash)
+
+                        if should_skip:
+                            if reason == "ignored_hash":
+                                stats.ignored += 1
+                            elif reason == "duplicate":
+                                stats.duplicates += 1
+                            elif reason == "too_small":
+                                stats.filtered_by_size += 1
+                            continue
+
+                        ext = os.path.splitext(img_path)[1].lower()
+                        self.save_image(img_data, output_dir, stats.saved, ext)
+                        stats.saved += 1
+
+                    except Exception:
+                        missing_images.append(img_path)
+
+                stats.missing = len(set(missing_images))
+
+        except zipfile.BadZipFile:
+            raise InvalidFileError(file_path, "EPUB", "Invalid or corrupted ZIP file")
+        except Exception as e:
+            raise ExtractionError(file_path, str(e))
+
+        return stats
 
     def extract_images_from_epub(
         self, epub_path: str, output_dir: str, use_html_refs: bool = True
     ) -> Dict[str, int]:
-        """
-        Extract images from a single EPUB file.
-
-        Args:
-            epub_path: Path to the EPUB file
-            output_dir: Output directory for extracted images
-            use_html_refs: Whether to use HTML references or extract all images
-
-        Returns:
-            Dictionary with extraction statistics
-        """
-        stats = {"saved": 0, "ignored": 0, "missing": 0}
-
-        if os.path.exists(output_dir):
-            shutil.rmtree(output_dir)
-        os.makedirs(output_dir)
-
-        with zipfile.ZipFile(epub_path, "r") as zipf:
-            all_files = zipf.namelist()
-
-            if use_html_refs:
-                image_paths, missing_images = self.extract_image_references(
-                    zipf, all_files
-                )
-                if not image_paths:
-                    image_paths = [
-                        f
-                        for f in all_files
-                        if os.path.splitext(f)[1].lower() in self.IMAGE_EXTENSIONS
-                    ]
-                    print(
-                        f"No valid HTML images found. Using {len(image_paths)} images from ZIP."
-                    )
-                else:
-                    print(f"{len(image_paths)} image(s) found via HTML.")
-            else:
-                image_paths = [
-                    f
-                    for f in all_files
-                    if os.path.splitext(f)[1].lower() in self.IMAGE_EXTENSIONS
-                ]
-                missing_images = []
-                print(f"Extracting all {len(image_paths)} images found in ZIP.")
-
-            for img_path in image_paths:
-                try:
-                    img_data = zipf.read(img_path)
-                    img_hash = self.hash_bytes_sha256(img_data)
-
-                    if img_hash in self.ignored_hashes:
-                        stats["ignored"] += 1
-                        continue
-
-                    ext = os.path.splitext(img_path)[1].lower()
-                    filename = f"{stats['saved']:04}{ext}"
-
-                    with open(os.path.join(output_dir, filename), "wb") as out_file:
-                        out_file.write(img_data)
-                    stats["saved"] += 1
-
-                except Exception:
-                    missing_images.append(img_path)
-
-            stats["missing"] = len(set(missing_images))
-
-        return stats
+        stats = self.extract_images(epub_path, output_dir, dry_run=False, use_html_refs=use_html_refs)
+        return stats.to_dict()
 
     def extract_from_directory(
-        self, directory: str, use_html_refs: bool = True
-    ) -> None:
-        """
-        Extract images from all EPUB files in a directory.
+        self,
+        directory: str,
+        use_html_refs: bool = True,
+        recursive: bool = False,
+        dry_run: bool = False,
+    ) -> Dict[str, ExtractionStats]:
+        files = self.find_files(directory, recursive)
 
-        Args:
-            directory: Directory containing EPUB files
-            use_html_refs: Whether to use HTML references or extract all images
-        """
-        epub_files = self.find_epub_files(directory)
+        if not files:
+            self.logger.info("No EPUB files found.")
+            return {}
 
-        if not epub_files:
-            print("No .epub files found.")
-            return
+        self.logger.info(f"{len(files)} EPUB file(s) found")
+        for f in files:
+            self.logger.info(f"  - {os.path.basename(f)}")
 
-        print(f"{len(epub_files)} EPUB file(s) found:")
-        for epub_file in epub_files:
-            print(f"  - {os.path.basename(epub_file)}")
+        results: Dict[str, ExtractionStats] = {}
+        total_stats = ExtractionStats()
 
-        total_stats = {"saved": 0, "ignored": 0, "missing": 0}
+        for file_path in files:
+            file_name = os.path.splitext(os.path.basename(file_path))[0]
+            output_dir = os.path.join(directory, file_name)
 
-        for epub_path in epub_files:
-            epub_name = os.path.splitext(os.path.basename(epub_path))[0]
-            output_dir = os.path.join(directory, epub_name)
+            self.logger.info(f"Processing: {os.path.basename(file_path)}")
 
-            print(f"\nProcessing: {os.path.basename(epub_path)}")
+            if dry_run:
+                print(f"[DRY RUN] Would extract to: {output_dir}")
 
-            stats = self.extract_images_from_epub(epub_path, output_dir, use_html_refs)
+            self.reset_extraction_state()
 
-            for key in total_stats:
-                total_stats[key] += stats[key]
+            stats = self.extract_images(file_path, output_dir, dry_run, use_html_refs)
+            results[file_path] = stats
 
-            print(f"  Total images extracted: {stats['saved']}")
-            print(f"  {stats['ignored']} image(s) ignored by hash.")
-            if stats["missing"] > 0:
-                print(
-                    f"  {stats['missing']} image(s) not found (referenced but missing)."
-                )
-            else:
-                print("  No missing referenced images.")
+            total_stats.saved += stats.saved
+            total_stats.ignored += stats.ignored
+            total_stats.missing += stats.missing
+            total_stats.duplicates += stats.duplicates
+            total_stats.filtered_by_size += stats.filtered_by_size
 
+            self.print_stats(stats, prefix="  ")
             print(f"  Extraction completed for: {output_dir}")
 
-        print("\n=== TOTAL STATISTICS ===")
-        print(f"EPUB files processed: {len(epub_files)}")
-        print(f"Total images extracted: {total_stats['saved']}")
-        print(f"Total images ignored: {total_stats['ignored']}")
-        print(f"Total missing images: {total_stats['missing']}")
+        print(f"\n=== TOTAL STATISTICS ===")
+        print(f"EPUB files processed: {len(files)}")
+        self.print_stats(total_stats)
 
-    def add_ignored_hash(self, hash_value: str) -> None:
-        """
-        Add a hash to the ignored list.
-
-        Args:
-            hash_value: SHA256 hash to ignore
-        """
-        self.ignored_hashes.add(hash_value)
-
-    def remove_ignored_hash(self, hash_value: str) -> None:
-        """
-        Remove a hash from the ignored list.
-
-        Args:
-            hash_value: SHA256 hash to remove from ignored list
-        """
-        self.ignored_hashes.discard(hash_value)
+        return results
 
 
 def main():
-    """Main function for command-line usage."""
     import argparse
 
     parser = argparse.ArgumentParser(description="Extract images from EPUB files")
@@ -368,16 +374,37 @@ def main():
     parser.add_argument(
         "--add-ignore-hash", help="Add a SHA256 hash to the ignore list"
     )
+    parser.add_argument(
+        "--recursive", "-r",
+        action="store_true",
+        help="Search for EPUB files recursively",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be extracted without extracting",
+    )
+    parser.add_argument(
+        "--min-size",
+        type=int,
+        default=0,
+        help="Minimum image size in bytes to extract",
+    )
 
     args = parser.parse_args()
 
-    extractor = EPUBImageExtractor()
+    extractor = EPUBImageExtractor(min_image_size=args.min_size)
 
     if args.add_ignore_hash:
         extractor.add_ignored_hash(args.add_ignore_hash)
         print(f"Hash added to ignore list: {args.add_ignore_hash}")
 
-    extractor.extract_from_directory(args.directory, not args.all_images)
+    extractor.extract_from_directory(
+        args.directory,
+        use_html_refs=not args.all_images,
+        recursive=args.recursive,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == "__main__":
