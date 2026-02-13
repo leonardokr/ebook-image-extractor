@@ -7,8 +7,12 @@ import tempfile
 import os
 import shutil
 import struct
+import zipfile
 from src.epub_extractor import EPUBImageExtractor
 from src.mobi_extractor import MobiImageExtractor
+from src.image_analysis import parse_image_metrics, classify_image
+from src.archive_exporter import export_directory_as_comic_archive
+from src.pdf_exporter import export_directory_as_pdf
 
 
 class TestEPUBImageExtractor(unittest.TestCase):
@@ -236,7 +240,6 @@ class TestMobiImageExtractor(unittest.TestCase):
             cursor = end
         data = b"".join(chunks)
 
-        # html_order contains relative refs 0,1,2 while real images start at record 2.
         image_records = self.extractor._get_image_records_in_order(
             data, offsets, [0, 1, 2], first_image_index=2
         )
@@ -275,7 +278,6 @@ class TestMobiImageExtractor(unittest.TestCase):
             cursor = end
         data = b"".join(chunks)
 
-        # Image records are [2,3,4,5]; refs are [1,4,2] in reading order.
         image_records = self.extractor._get_image_records_in_order(
             data, offsets, html_order=[1, 4, 2], first_image_index=0
         )
@@ -288,20 +290,20 @@ class TestMobiImageExtractor(unittest.TestCase):
 
     def test_read_pdb_records_insufficient_data(self):
         """Test PDB record reading with insufficient data."""
-        short_data = b"TPZ" + b"\x00" * 70  # Not enough data for full header
+        short_data = b"TPZ" + b"\x00" * 70
         result = self.extractor._read_pdb_records(short_data)
         self.assertEqual(result, [])
 
     def create_mock_mobi_file(self, filename):
         """Create a mock MOBI file for testing."""
-        mock_data = b"TPZ"  # PDB identifier
-        mock_data += b"\x00" * 73  # Padding to reach record count position
-        mock_data += struct.pack(">H", 2)  # 2 records
-        mock_data += struct.pack(">L", 100)  # First record offset
-        mock_data += b"\x00" * 4  # Record attributes/ID
-        mock_data += struct.pack(">L", 200)  # Second record offset
-        mock_data += b"\x00" * 4  # Record attributes/ID
-        mock_data += b"\x00" * 22  # Padding to reach first record
+        mock_data = b"TPZ"
+        mock_data += b"\x00" * 73
+        mock_data += struct.pack(">H", 2)
+        mock_data += struct.pack(">L", 100)
+        mock_data += b"\x00" * 4
+        mock_data += struct.pack(">L", 200)
+        mock_data += b"\x00" * 4
+        mock_data += b"\x00" * 22
         mock_data += b"MOBI header data" + b"\x00" * 84
         mock_data += (
             b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xff\xdb"
@@ -383,7 +385,15 @@ class TestExtractorCompatibility(unittest.TestCase):
         stats = ExtractionStats()
         stats_dict = stats.to_dict()
 
-        required_keys = {"saved", "ignored", "missing", "duplicates", "filtered_by_size"}
+        required_keys = {
+            "saved",
+            "ignored",
+            "missing",
+            "duplicates",
+            "filtered_by_size",
+            "filtered_by_dimensions",
+            "filtered_by_aspect_ratio",
+        }
         self.assertEqual(set(stats_dict.keys()), required_keys)
 
     def test_image_extensions_compatibility(self):
@@ -396,6 +406,68 @@ class TestExtractorCompatibility(unittest.TestCase):
         for ext in common_extensions:
             self.assertIn(ext, epub_extensions)
             self.assertIn(ext, mobi_extensions)
+
+    def test_image_analysis_metrics_png(self):
+        """Test metric parser for PNG dimensions."""
+        png_data = (
+            b"\x89PNG\r\n\x1a\n"
+            b"\x00\x00\x00\rIHDR"
+            b"\x00\x00\x01\x00"
+            b"\x00\x00\x02\x00"
+            b"\x08\x02\x00\x00\x00"
+        )
+        metrics = parse_image_metrics(png_data)
+        self.assertEqual(metrics.width, 256)
+        self.assertEqual(metrics.height, 512)
+        self.assertEqual(metrics.extension, ".png")
+
+    def test_image_classification_cover(self):
+        """Test image role classification for cover images."""
+        png_data = (
+            b"\x89PNG\r\n\x1a\n"
+            b"\x00\x00\x00\rIHDR"
+            b"\x00\x00\x01\x00"
+            b"\x00\x00\x02\x00"
+            b"\x08\x02\x00\x00\x00"
+        )
+        metrics = parse_image_metrics(png_data)
+        role = classify_image(metrics, is_cover=True)
+        self.assertEqual(role, "cover")
+
+    def test_archive_export_cbz_and_cbr(self):
+        """Test CBZ and CBR archive creation."""
+        output_dir = os.path.join(self.temp_dir, "book")
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "0000_page.jpg"), "wb") as handle:
+            handle.write(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00")
+
+        cbz = export_directory_as_comic_archive(output_dir, "cbz")
+        cbr = export_directory_as_comic_archive(output_dir, "cbr")
+
+        self.assertTrue(os.path.exists(cbz))
+        self.assertTrue(os.path.exists(cbr))
+
+        with zipfile.ZipFile(cbz, "r") as zipf:
+            self.assertIn("0000_page.jpg", zipf.namelist())
+
+    def test_pdf_export(self):
+        """Test PDF export behavior."""
+        output_dir = os.path.join(self.temp_dir, "book_pdf")
+        os.makedirs(output_dir, exist_ok=True)
+        try:
+            from PIL import Image
+        except ImportError:
+            with open(os.path.join(output_dir, "0000_page.jpg"), "wb") as handle:
+                handle.write(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00")
+            with self.assertRaises(RuntimeError):
+                export_directory_as_pdf(output_dir)
+            return
+
+        image = Image.new("RGB", (64, 64), color=(255, 255, 255))
+        image.save(os.path.join(output_dir, "0000_page.jpg"), "JPEG")
+        image.close()
+        pdf_path = export_directory_as_pdf(output_dir)
+        self.assertTrue(os.path.exists(pdf_path))
 
 
 if __name__ == "__main__":
