@@ -12,7 +12,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="ebook-image-extractor",
-    version="3.0.0",
+    version="4.0.0",
     author="Leonardo Klein",
     author_email="leo@ziondev.us",
     description="Python tool to extract images from EPUB and MOBI files with intelligent filtering",
