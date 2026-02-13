@@ -6,7 +6,6 @@ Extracts images from MOBI/AZW files with proper reading order support.
 
 import struct
 import os
-import zlib
 import re
 from typing import List, Set, Dict, Optional, Tuple
 import logging
@@ -275,12 +274,18 @@ class MobiImageExtractor(BaseExtractor):
         self, data: bytes, records: List[Tuple[int, int]], palmdoc_header: Dict, mobi_header: Dict
     ) -> bytes:
         compression = palmdoc_header.get("compression", 1)
-
-        first_image_record = self._find_first_image_record(data, records)
+        record_count = palmdoc_header.get("record_count", 0)
 
         text_content = bytearray()
 
-        for i in range(1, first_image_record):
+        # Prefer official text record count from PalmDOC header.
+        # Fallback to first detected image record for malformed files.
+        if isinstance(record_count, int) and record_count > 0:
+            text_record_end = min(1 + record_count, len(records))
+        else:
+            text_record_end = self._find_first_image_record(data, records)
+
+        for i in range(1, text_record_end):
             if i >= len(records):
                 break
 
@@ -312,16 +317,30 @@ class MobiImageExtractor(BaseExtractor):
         """
         image_order = []
         seen = set()
-        pattern = rb'<img[^>]+src=["\']?(?:Images/)?(?:image|cover|thumb)?0*(\d+)\.\w+["\']?'
+        tag_pattern = rb"<img\b[^>]*>"
+        value_patterns = [
+            # Common MOBI path pattern: Images/image00012.jpg
+            rb'src=["\']?[^"\'>]*?(?:image|cover|thumb)0*(\d+)\.\w+["\']?',
+            # Kindle embedded references: kindle:embed:12?mime=image/jpeg
+            rb'src=["\']?kindle:embed:0*(\d+)(?:\?[^"\']*)?["\']?',
+            # Some variants use explicit recindex attribute in img tags
+            rb'recindex=["\']?0*(\d+)["\']?',
+        ]
 
-        for match in re.finditer(pattern, html_content, re.IGNORECASE):
-            try:
-                record_idx = int(match.group(1))
-                if record_idx not in seen:
-                    seen.add(record_idx)
-                    image_order.append(record_idx)
-            except (ValueError, IndexError):
-                continue
+        for tag_match in re.finditer(tag_pattern, html_content, re.IGNORECASE):
+            tag = tag_match.group(0)
+            for pattern in value_patterns:
+                match = re.search(pattern, tag, re.IGNORECASE)
+                if not match:
+                    continue
+                try:
+                    record_idx = int(match.group(1))
+                    if record_idx not in seen:
+                        seen.add(record_idx)
+                        image_order.append(record_idx)
+                except (ValueError, IndexError):
+                    pass
+                break
 
         return image_order
 
@@ -330,12 +349,14 @@ class MobiImageExtractor(BaseExtractor):
         data: bytes,
         records: List[Tuple[int, int]],
         html_order: Optional[List[int]] = None,
+        first_image_index: int = 0,
     ) -> List[Tuple[int, bytes]]:
         """
         Get image records in the correct reading order.
 
         If html_order is provided, images are returned in that order.
-        Otherwise, falls back to sequential order.
+        Supports absolute record indices and indices relative to first_image_index.
+        If html_order is missing or partial, falls back to sequential record order.
         """
         image_map: Dict[int, bytes] = {}
         for i, (start, end) in enumerate(records):
@@ -347,15 +368,65 @@ class MobiImageExtractor(BaseExtractor):
             if self._is_image_data(record_data):
                 image_map[i] = record_data
 
-        if not html_order:
-            return []
-
         image_records = []
         seen = set()
-        for record_idx in html_order:
-            if record_idx in image_map and record_idx not in seen:
-                seen.add(record_idx)
-                image_records.append((record_idx, image_map[record_idx]))
+        sorted_image_indices = sorted(image_map)
+
+        inferred_first_image_index = first_image_index
+        if inferred_first_image_index <= 0 and sorted_image_indices:
+            inferred_first_image_index = sorted_image_indices[0]
+
+        if html_order:
+            strategies = [("absolute", 0)]
+            if inferred_first_image_index > 0:
+                # If references include 0, prefer 0-based relative mapping.
+                prefer_zero_based = any(idx == 0 for idx in html_order)
+                if prefer_zero_based:
+                    strategies.extend([("relative0", inferred_first_image_index), ("relative1", inferred_first_image_index)])
+                else:
+                    strategies.extend([("relative1", inferred_first_image_index), ("relative0", inferred_first_image_index)])
+
+            best_strategy = ("absolute", 0)
+            best_match_count = -1
+            for strategy, base in strategies:
+                local_seen = set()
+                for ref_idx in html_order:
+                    if strategy == "absolute":
+                        candidate = ref_idx
+                    elif strategy == "relative0":
+                        candidate = base + ref_idx
+                    else:
+                        candidate = base + ref_idx - 1
+
+                    if candidate in image_map:
+                        local_seen.add(candidate)
+
+                match_count = len(local_seen)
+                if match_count > best_match_count:
+                    best_match_count = match_count
+                    best_strategy = (strategy, base)
+
+            strategy, base = best_strategy
+            for ref_idx in html_order:
+                if strategy == "absolute":
+                    candidate = ref_idx
+                elif strategy == "relative0":
+                    candidate = base + ref_idx
+                else:
+                    candidate = base + ref_idx - 1
+
+                if candidate in image_map and candidate not in seen:
+                    seen.add(candidate)
+                    image_records.append((candidate, image_map[candidate]))
+
+        # Keep deterministic output and avoid missing images not referenced in HTML.
+        for record_idx in sorted_image_indices:
+            if record_idx in seen:
+                continue
+            if inferred_first_image_index > 0 and record_idx < inferred_first_image_index:
+                continue
+            seen.add(record_idx)
+            image_records.append((record_idx, image_map[record_idx]))
 
         return image_records
 
@@ -439,6 +510,7 @@ class MobiImageExtractor(BaseExtractor):
                     )
 
             html_order = None
+            first_image_index = mobi_header.get("first_image_index", 0) if mobi_header else 0
             if palmdoc_header and mobi_header:
                 try:
                     html_content = self._extract_text_content(
@@ -450,7 +522,9 @@ class MobiImageExtractor(BaseExtractor):
                 except Exception as e:
                     self.logger.warning(f"Could not extract HTML order: {e}")
 
-            image_records = self._get_image_records_in_order(data, records, html_order)
+            image_records = self._get_image_records_in_order(
+                data, records, html_order, first_image_index
+            )
             self.logger.info(f"Found {len(image_records)} images in MOBI file")
 
             if dry_run:

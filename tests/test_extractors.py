@@ -210,6 +210,77 @@ class TestMobiImageExtractor(unittest.TestCase):
         result = self.extractor._get_image_extension(unknown_data)
         self.assertEqual(result, ".jpg")
 
+    def test_extract_image_order_from_html_mixed_sources(self):
+        """Test reading order extraction with mixed MOBI img source formats."""
+        html = (
+            b'<img src="Images/image0003.jpg" />'
+            b'<img src="kindle:embed:0001?mime=image/jpeg" />'
+            b'<img recindex="0002" />'
+        )
+        result = self.extractor._extract_image_order_from_html(html)
+        self.assertEqual(result, [3, 1, 2])
+
+    def test_get_image_records_in_order_maps_relative_indices(self):
+        """Test relative image references are mapped using first_image_index."""
+        jpeg1 = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00"
+        jpeg2 = b"\xff\xd8\xff\xe0\x00\x10JFIF\x01"
+        jpeg3 = b"\xff\xd8\xff\xe0\x00\x10JFIF\x02"
+
+        chunks = [b"HEAD", b"TEXT", jpeg1, jpeg2, jpeg3]
+        offsets = []
+        cursor = 0
+        for chunk in chunks:
+            start = cursor
+            end = start + len(chunk)
+            offsets.append((start, end))
+            cursor = end
+        data = b"".join(chunks)
+
+        # html_order contains relative refs 0,1,2 while real images start at record 2.
+        image_records = self.extractor._get_image_records_in_order(
+            data, offsets, [0, 1, 2], first_image_index=2
+        )
+        self.assertEqual([idx for idx, _ in image_records], [2, 3, 4])
+
+    def test_get_image_records_in_order_fallback_without_html(self):
+        """Test fallback to sequential image records when no HTML order is available."""
+        jpeg1 = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00"
+        jpeg2 = b"\xff\xd8\xff\xe0\x00\x10JFIF\x01"
+
+        chunks = [b"HEAD", jpeg1, b"TEXT", jpeg2]
+        offsets = []
+        cursor = 0
+        for chunk in chunks:
+            start = cursor
+            end = start + len(chunk)
+            offsets.append((start, end))
+            cursor = end
+        data = b"".join(chunks)
+
+        image_records = self.extractor._get_image_records_in_order(
+            data, offsets, html_order=None, first_image_index=1
+        )
+        self.assertEqual([idx for idx, _ in image_records], [1, 3])
+
+    def test_get_image_records_in_order_infers_relative_one_based(self):
+        """Test 1-based relative refs when header first_image_index is missing."""
+        jpeg = lambda n: b"\xff\xd8\xff\xe0\x00\x10JFIF" + bytes([n])
+        chunks = [b"HEAD", b"TEXT", jpeg(0), jpeg(1), jpeg(2), jpeg(3)]
+        offsets = []
+        cursor = 0
+        for chunk in chunks:
+            start = cursor
+            end = start + len(chunk)
+            offsets.append((start, end))
+            cursor = end
+        data = b"".join(chunks)
+
+        # Image records are [2,3,4,5]; refs are [1,4,2] in reading order.
+        image_records = self.extractor._get_image_records_in_order(
+            data, offsets, html_order=[1, 4, 2], first_image_index=0
+        )
+        self.assertEqual([idx for idx, _ in image_records], [2, 5, 3, 4])
+
     def test_read_pdb_records_empty_data(self):
         """Test PDB record reading with empty data."""
         result = self.extractor._read_pdb_records(b"")
