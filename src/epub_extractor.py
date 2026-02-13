@@ -13,6 +13,7 @@ from bs4.element import Tag
 
 from .base_extractor import BaseExtractor, ExtractionStats, BookMetadata
 from .exceptions import InvalidFileError, ExtractionError
+from .image_analysis import parse_image_metrics, classify_image
 
 
 class EPUBImageExtractor(BaseExtractor):
@@ -36,10 +37,33 @@ class EPUBImageExtractor(BaseExtractor):
         self,
         ignored_hashes: Optional[Set[str]] = None,
         min_image_size: int = 0,
+        min_width: int = 0,
+        min_height: int = 0,
+        max_aspect_ratio: float = 0.0,
         enable_deduplication: bool = True,
         logger: Optional[logging.Logger] = None,
+        show_progress: bool = True,
+        write_manifest: bool = False,
+        write_debug_order: bool = False,
+        archive_format: Optional[str] = None,
+        hash_cache_path: Optional[str] = None,
+        parallelism: int = 1,
     ):
-        super().__init__(ignored_hashes, min_image_size, enable_deduplication, logger)
+        super().__init__(
+            ignored_hashes=ignored_hashes,
+            min_image_size=min_image_size,
+            min_width=min_width,
+            min_height=min_height,
+            max_aspect_ratio=max_aspect_ratio,
+            enable_deduplication=enable_deduplication,
+            logger=logger,
+            show_progress=show_progress,
+            write_manifest=write_manifest,
+            write_debug_order=write_debug_order,
+            archive_format=archive_format,
+            hash_cache_path=hash_cache_path,
+            parallelism=parallelism,
+        )
 
     def find_files(self, directory: str, recursive: bool = False) -> List[str]:
         epub_files = []
@@ -224,13 +248,25 @@ class EPUBImageExtractor(BaseExtractor):
         self, file_path: str, output_dir: str, dry_run: bool = False, use_html_refs: bool = True
     ) -> ExtractionStats:
         stats = ExtractionStats()
+        manifest = None
+        debug_order = {
+            "mode": "epub",
+            "use_html_refs": use_html_refs,
+            "ordered_html_files": [],
+            "image_references": [],
+            "saved_mappings": [],
+        }
 
         try:
             with zipfile.ZipFile(file_path, "r") as zipf:
                 all_files = zipf.namelist()
+                if not dry_run and (self.write_manifest or self.write_debug_order or self.archive_format):
+                    manifest = self.build_manifest(file_path, output_dir)
 
                 if use_html_refs:
+                    debug_order["ordered_html_files"] = self.get_reading_order(zipf, all_files)
                     image_paths, missing_images = self.extract_image_references(zipf, all_files)
+                    debug_order["image_references"] = image_paths.copy()
                     if not image_paths:
                         image_paths = [
                             f for f in all_files
@@ -253,16 +289,21 @@ class EPUBImageExtractor(BaseExtractor):
                     for img_path in image_paths:
                         try:
                             img_data = zipf.read(img_path)
+                            metrics = parse_image_metrics(img_data)
                             img_hash = self.hash_bytes_sha256(img_data)
-                            should_skip, reason = self.should_skip_image(img_data, img_hash)
+                            should_skip, reason = self.should_skip_image(img_data, img_hash, metrics)
                             if not should_skip:
                                 stats.saved += 1
                             elif reason == "ignored_hash":
                                 stats.ignored += 1
-                            elif reason == "duplicate":
+                            elif reason in {"duplicate", "duplicate_cache"}:
                                 stats.duplicates += 1
                             elif reason == "too_small":
                                 stats.filtered_by_size += 1
+                            elif reason in {"too_narrow", "too_short"}:
+                                stats.filtered_by_dimensions += 1
+                            elif reason == "extreme_aspect_ratio":
+                                stats.filtered_by_aspect_ratio += 1
                         except Exception:
                             stats.missing += 1
                     return stats
@@ -272,26 +313,56 @@ class EPUBImageExtractor(BaseExtractor):
                 for img_path in image_paths:
                     try:
                         img_data = zipf.read(img_path)
+                        metrics = parse_image_metrics(img_data)
                         img_hash = self.hash_bytes_sha256(img_data)
-                        should_skip, reason = self.should_skip_image(img_data, img_hash)
+                        should_skip, reason = self.should_skip_image(img_data, img_hash, metrics)
 
                         if should_skip:
                             if reason == "ignored_hash":
                                 stats.ignored += 1
-                            elif reason == "duplicate":
+                            elif reason in {"duplicate", "duplicate_cache"}:
                                 stats.duplicates += 1
                             elif reason == "too_small":
                                 stats.filtered_by_size += 1
+                            elif reason in {"too_narrow", "too_short"}:
+                                stats.filtered_by_dimensions += 1
+                            elif reason == "extreme_aspect_ratio":
+                                stats.filtered_by_aspect_ratio += 1
                             continue
 
                         ext = os.path.splitext(img_path)[1].lower()
-                        self.save_image(img_data, output_dir, stats.saved, ext)
+                        classification = classify_image(metrics, is_cover=("cover" in img_path.lower()))
+                        output_path = self.save_image(
+                            img_data,
+                            output_dir,
+                            stats.saved,
+                            ext,
+                            classification=classification,
+                        )
+                        if manifest:
+                            self.add_manifest_item(
+                                manifest=manifest,
+                                index=stats.saved,
+                                filename=os.path.basename(output_path),
+                                source_ref=img_path,
+                                image_hash=img_hash,
+                                metrics=metrics,
+                                classification=classification,
+                            )
+                        debug_order["saved_mappings"].append(
+                            {
+                                "source_ref": img_path,
+                                "output_index": stats.saved,
+                                "output_file": os.path.basename(output_path),
+                            }
+                        )
                         stats.saved += 1
 
                     except Exception:
                         missing_images.append(img_path)
 
                 stats.missing = len(set(missing_images))
+                self.finalize_book_output(output_dir, manifest, debug_order)
 
         except zipfile.BadZipFile:
             raise InvalidFileError(file_path, "EPUB", "Invalid or corrupted ZIP file")

@@ -12,6 +12,7 @@ import logging
 
 from .base_extractor import BaseExtractor, ExtractionStats, BookMetadata
 from .exceptions import InvalidFileError, CorruptedFileError, ExtractionError
+from .image_analysis import parse_image_metrics, classify_image
 
 
 class MobiImageExtractor(BaseExtractor):
@@ -54,10 +55,33 @@ class MobiImageExtractor(BaseExtractor):
         self,
         ignored_hashes: Optional[Set[str]] = None,
         min_image_size: int = 0,
+        min_width: int = 0,
+        min_height: int = 0,
+        max_aspect_ratio: float = 0.0,
         enable_deduplication: bool = True,
         logger: Optional[logging.Logger] = None,
+        show_progress: bool = True,
+        write_manifest: bool = False,
+        write_debug_order: bool = False,
+        archive_format: Optional[str] = None,
+        hash_cache_path: Optional[str] = None,
+        parallelism: int = 1,
     ):
-        super().__init__(ignored_hashes, min_image_size, enable_deduplication, logger)
+        super().__init__(
+            ignored_hashes=ignored_hashes,
+            min_image_size=min_image_size,
+            min_width=min_width,
+            min_height=min_height,
+            max_aspect_ratio=max_aspect_ratio,
+            enable_deduplication=enable_deduplication,
+            logger=logger,
+            show_progress=show_progress,
+            write_manifest=write_manifest,
+            write_debug_order=write_debug_order,
+            archive_format=archive_format,
+            hash_cache_path=hash_cache_path,
+            parallelism=parallelism,
+        )
         self._mobi_header: Dict = {}
         self._exth_data: Dict = {}
 
@@ -278,8 +302,6 @@ class MobiImageExtractor(BaseExtractor):
 
         text_content = bytearray()
 
-        # Prefer official text record count from PalmDOC header.
-        # Fallback to first detected image record for malformed files.
         if isinstance(record_count, int) and record_count > 0:
             text_record_end = min(1 + record_count, len(records))
         else:
@@ -319,11 +341,8 @@ class MobiImageExtractor(BaseExtractor):
         seen = set()
         tag_pattern = rb"<img\b[^>]*>"
         value_patterns = [
-            # Common MOBI path pattern: Images/image00012.jpg
             rb'src=["\']?[^"\'>]*?(?:image|cover|thumb)0*(\d+)\.\w+["\']?',
-            # Kindle embedded references: kindle:embed:12?mime=image/jpeg
             rb'src=["\']?kindle:embed:0*(\d+)(?:\?[^"\']*)?["\']?',
-            # Some variants use explicit recindex attribute in img tags
             rb'recindex=["\']?0*(\d+)["\']?',
         ]
 
@@ -379,7 +398,6 @@ class MobiImageExtractor(BaseExtractor):
         if html_order:
             strategies = [("absolute", 0)]
             if inferred_first_image_index > 0:
-                # If references include 0, prefer 0-based relative mapping.
                 prefer_zero_based = any(idx == 0 for idx in html_order)
                 if prefer_zero_based:
                     strategies.extend([("relative0", inferred_first_image_index), ("relative1", inferred_first_image_index)])
@@ -419,7 +437,6 @@ class MobiImageExtractor(BaseExtractor):
                     seen.add(candidate)
                     image_records.append((candidate, image_map[candidate]))
 
-        # Keep deterministic output and avoid missing images not referenced in HTML.
         for record_idx in sorted_image_indices:
             if record_idx in seen:
                 continue
@@ -485,6 +502,7 @@ class MobiImageExtractor(BaseExtractor):
         self, file_path: str, output_dir: str, dry_run: bool = False
     ) -> ExtractionStats:
         stats = ExtractionStats()
+        manifest = None
 
         try:
             with open(file_path, "rb") as f:
@@ -502,6 +520,13 @@ class MobiImageExtractor(BaseExtractor):
             record0_start = records[0][0]
             palmdoc_header = self._read_palmdoc_header(data, record0_start)
             mobi_header = self._read_mobi_header(data, record0_start)
+            debug_order = {
+                "mode": "mobi",
+                "first_image_index": mobi_header.get("first_image_index", 0) if mobi_header else 0,
+                "html_refs": [],
+                "resolved_record_indices": [],
+                "saved_mappings": [],
+            }
 
             if mobi_header:
                 if mobi_header.get("exth_flags", 0) & 0x40:
@@ -518,6 +543,7 @@ class MobiImageExtractor(BaseExtractor):
                     )
                     if html_content:
                         html_order = self._extract_image_order_from_html(html_content)
+                        debug_order["html_refs"] = html_order.copy()
                         self.logger.debug(f"Found {len(html_order)} images in HTML reading order")
                 except Exception as e:
                     self.logger.warning(f"Could not extract HTML order: {e}")
@@ -525,40 +551,79 @@ class MobiImageExtractor(BaseExtractor):
             image_records = self._get_image_records_in_order(
                 data, records, html_order, first_image_index
             )
+            debug_order["resolved_record_indices"] = [idx for idx, _ in image_records]
             self.logger.info(f"Found {len(image_records)} images in MOBI file")
+            if not dry_run and (self.write_manifest or self.write_debug_order or self.archive_format):
+                manifest = self.build_manifest(file_path, output_dir)
 
             if dry_run:
                 for idx, record_data in image_records:
+                    metrics = parse_image_metrics(record_data)
                     img_hash = self.hash_bytes_sha256(record_data)
-                    should_skip, reason = self.should_skip_image(record_data, img_hash)
+                    should_skip, reason = self.should_skip_image(record_data, img_hash, metrics)
                     if not should_skip:
                         stats.saved += 1
                     elif reason == "ignored_hash":
                         stats.ignored += 1
-                    elif reason == "duplicate":
+                    elif reason in {"duplicate", "duplicate_cache"}:
                         stats.duplicates += 1
                     elif reason == "too_small":
                         stats.filtered_by_size += 1
+                    elif reason in {"too_narrow", "too_short"}:
+                        stats.filtered_by_dimensions += 1
+                    elif reason == "extreme_aspect_ratio":
+                        stats.filtered_by_aspect_ratio += 1
                 return stats
 
             self.prepare_output_directory(output_dir)
 
             for idx, record_data in image_records:
+                metrics = parse_image_metrics(record_data)
                 img_hash = self.hash_bytes_sha256(record_data)
-                should_skip, reason = self.should_skip_image(record_data, img_hash)
+                should_skip, reason = self.should_skip_image(record_data, img_hash, metrics)
 
                 if should_skip:
                     if reason == "ignored_hash":
                         stats.ignored += 1
-                    elif reason == "duplicate":
+                    elif reason in {"duplicate", "duplicate_cache"}:
                         stats.duplicates += 1
                     elif reason == "too_small":
                         stats.filtered_by_size += 1
+                    elif reason in {"too_narrow", "too_short"}:
+                        stats.filtered_by_dimensions += 1
+                    elif reason == "extreme_aspect_ratio":
+                        stats.filtered_by_aspect_ratio += 1
                     continue
 
                 ext = self._get_image_extension(record_data)
-                self.save_image(record_data, output_dir, stats.saved, ext)
+                classification = classify_image(metrics, is_cover=False)
+                output_path = self.save_image(
+                    record_data,
+                    output_dir,
+                    stats.saved,
+                    ext,
+                    classification=classification,
+                )
+                if manifest:
+                    self.add_manifest_item(
+                        manifest=manifest,
+                        index=stats.saved,
+                        filename=os.path.basename(output_path),
+                        source_ref=f"record:{idx}",
+                        image_hash=img_hash,
+                        metrics=metrics,
+                        classification=classification,
+                    )
+                debug_order["saved_mappings"].append(
+                    {
+                        "record_index": idx,
+                        "output_index": stats.saved,
+                        "output_file": os.path.basename(output_path),
+                    }
+                )
                 stats.saved += 1
+
+            self.finalize_book_output(output_dir, manifest, debug_order)
 
         except (InvalidFileError, CorruptedFileError):
             raise
