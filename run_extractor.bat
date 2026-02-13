@@ -1,15 +1,17 @@
 @echo off
-REM Script to run eBook Image Extractor on Windows
-REM Supports EPUB and MOBI/AZW files
-REM Place this file in the folder where your eBooks are located
+setlocal
 
 echo eBook Image Extractor
 echo =====================
 echo Supports: EPUB, MOBI, AZW, AZW3
 echo.
 
-REM Check if Python is installed
-python --version >nul 2>&1
+set "PYTHON_CMD=python"
+if exist "%~dp0.venv\Scripts\python.exe" (
+    set "PYTHON_CMD=%~dp0.venv\Scripts\python.exe"
+)
+
+%PYTHON_CMD% --version >nul 2>&1
 if errorlevel 1 (
     echo ERROR: Python not found. Please install Python 3.8+ first.
     echo Download from: https://www.python.org/downloads/
@@ -17,24 +19,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Display Python version
-for /f "tokens=*" %%i in ('python --version 2^>^&1') do set PYTHON_VERSION=%%i
+for /f "tokens=*" %%i in ('%PYTHON_CMD% --version 2^>^&1') do set PYTHON_VERSION=%%i
 echo Found: %PYTHON_VERSION%
 
-REM Check if dependencies are installed
 echo Checking dependencies...
-python -c "import bs4" >nul 2>&1
+%PYTHON_CMD% -m pip install -r "%~dp0requirements.txt"
 if errorlevel 1 (
-    echo Installing BeautifulSoup4 for EPUB support...
-    pip install beautifulsoup4
-    if errorlevel 1 (
-        echo ERROR: Failed to install dependencies.
-        pause
-        exit /b 1
-    )
+    echo ERROR: Failed to install dependencies.
+    pause
+    exit /b 1
 )
 
-REM Check for available eBook files
 echo.
 echo Scanning for eBook files...
 set FOUND_FILES=0
@@ -68,10 +63,8 @@ echo.
 echo Starting extraction...
 echo =====================
 
-REM Run the extractor
-python "%~dp0main.py" "%~dp0"
+%PYTHON_CMD% "%~dp0main.py" extract "%~dp0" --recursive --format auto --manifest
 
-REM Check if extraction was successful
 if errorlevel 1 (
     echo.
     echo ERROR: Extraction failed. Check the error messages above.
@@ -84,3 +77,4 @@ if errorlevel 1 (
 echo.
 echo Press any key to exit...
 pause >nul
+endlocal
